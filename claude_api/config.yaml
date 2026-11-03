@@ -1,0 +1,28 @@
+name: Claude API
+version: "0.1.0"
+slug: claude_api
+description: Local HTTP API in front of the Claude Code CLI, using your own Claude Pro login.
+url: https://github.com/AzezSalami/ha-addon-claude
+arch:
+  - amd64
+  - aarch64
+init: false
+startup: application
+map:
+  - addon_config:rw
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: "HTTP API (POST /v1/ask). Keep it on your LAN."
+options:
+  api_token: ""
+  oauth_token: ""
+  default_model: ""
+  timeout_seconds: 120
+  max_concurrent: 1
+schema:
+  api_token: password
+  oauth_token: password?
+  default_model: str?
+  timeout_seconds: int(10,600)
+  max_concurrent: int(1,4)
