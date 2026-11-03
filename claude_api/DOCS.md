@@ -38,6 +38,11 @@ For apps that speak the OpenAI protocol (Open WebUI, LiteLLM and similar):
 - API key: your `api_token`
 - Model: any name. Names starting with `claude`, `sonnet`, `opus`, `haiku` or `fable` are passed to the CLI; anything else uses `default_model`.
 
+Clients that use Anthropic's native format (LiteLLM does this for models named `claude-*`) are supported too:
+`POST /v1/messages`, with the token in either `x-api-key` or `Authorization: Bearer`. For those, use the base URL
+without `/v1` (`http://<ha-host>:8099`), because the client appends `/v1/messages` itself. A doubled path such as
+`/v1//v1/messages` is tolerated.
+
 Supported: `POST /v1/chat/completions` (including `stream: true`, which returns the full reply as one chunk) and `GET /v1/models`.
 Tool calling and image input are not supported.
 

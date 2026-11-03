@@ -25,8 +25,9 @@ function send(res, status, body) {
 }
 
 function authorized(req) {
-  const header = req.headers['authorization'] || '';
-  const given = Buffer.from(header.replace(/^Bearer\s+/i, ''));
+  // OpenAI clients send "Authorization: Bearer", Anthropic clients send "x-api-key".
+  const header = req.headers['authorization'] || req.headers['x-api-key'] || '';
+  const given = Buffer.from(String(header).replace(/^Bearer\s+/i, ''));
   const expected = Buffer.from(API_TOKEN);
   return given.length === expected.length && crypto.timingSafeEqual(given, expected);
 }
@@ -175,16 +176,91 @@ async function chatCompletions(req, res, body) {
   });
 }
 
+function anthropicError(res, status, message) {
+  send(res, status, { type: 'error', error: { type: status === 401 ? 'authentication_error' : 'invalid_request_error', message } });
+}
+
+// Anthropic Messages API, for clients (such as LiteLLM with a claude-* model) that use the native format.
+async function anthropicMessages(req, res, body) {
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    return anthropicError(res, 400, 'messages (array) is required');
+  }
+  const turns = body.messages.map((m) => ({ role: m.role === 'assistant' ? 'Assistant' : 'User', text: contentText(m.content) }));
+  const prompt =
+    turns.length === 1 && turns[0].role === 'User'
+      ? turns[0].text
+      : turns.map((t) => `${t.role}: ${t.text}`).join('\n\n') + '\n\nAssistant:';
+
+  const out = await schedule(() =>
+    runClaude({ prompt, system: contentText(body.system), model: cliModel(body.model) })
+  );
+
+  const id = `msg_${crypto.randomBytes(12).toString('hex')}`;
+  const model = body.model || 'claude';
+  const inputTokens = (out.usage && out.usage.input_tokens) || 0;
+  const outputTokens = (out.usage && out.usage.output_tokens) || 0;
+
+  if (body.stream) {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+    const ev = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
+    ev('message_start', {
+      message: { id, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: inputTokens, output_tokens: 0 } },
+    });
+    ev('content_block_start', { index: 0, content_block: { type: 'text', text: '' } });
+    ev('content_block_delta', { index: 0, delta: { type: 'text_delta', text: out.result } });
+    ev('content_block_stop', { index: 0 });
+    ev('message_delta', { delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: outputTokens } });
+    ev('message_stop', {});
+    res.end();
+    return;
+  }
+
+  send(res, 200, {
+    id,
+    type: 'message',
+    role: 'assistant',
+    model,
+    content: [{ type: 'text', text: out.result }],
+    stop_reason: 'end_turn',
+    stop_sequence: null,
+    usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   try {
-    if (req.method === 'GET' && req.url === '/health') return send(res, 200, { ok: true });
-    if (!authorized(req)) return send(res, 401, { error: 'unauthorized' });
+    // Clients often glue base URL and path together badly (".../v1//v1/messages"), so normalize first.
+    const path = req.url.split('?')[0].replace(/\/+/g, '/').replace(/^(\/v1)+/, '/v1');
 
-    if (req.method === 'GET' && req.url === '/v1/models') {
+    if (req.method === 'GET' && path === '/health') return send(res, 200, { ok: true });
+    if (!authorized(req)) {
+      return path === '/v1/messages' ? anthropicError(res, 401, 'unauthorized') : send(res, 401, { error: 'unauthorized' });
+    }
+
+    if (req.method === 'POST' && path === '/v1/messages') {
+      let body;
+      try {
+        body = JSON.parse(await readBody(req));
+      } catch (e) {
+        return anthropicError(res, e.status || 400, e.status ? e.message : 'invalid JSON');
+      }
+      try {
+        const started = Date.now();
+        await anthropicMessages(req, res, body);
+        log(`messages ok in ${Date.now() - started}ms`);
+      } catch (e) {
+        log(`error: ${e.message}`);
+        if (!res.headersSent) anthropicError(res, e.status || 500, e.message);
+        else res.end();
+      }
+      return;
+    }
+
+    if (req.method === 'GET' && path === '/v1/models') {
       return send(res, 200, { object: 'list', data: [{ id: 'claude', object: 'model', owned_by: 'anthropic' }] });
     }
 
-    if (req.method === 'POST' && req.url === '/v1/chat/completions') {
+    if (req.method === 'POST' && path === '/v1/chat/completions') {
       let body;
       try {
         body = JSON.parse(await readBody(req));
@@ -203,7 +279,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (req.method === 'POST' && req.url === '/v1/ask') {
+    if (req.method === 'POST' && path === '/v1/ask') {
       let body;
       try {
         body = JSON.parse(await readBody(req));
