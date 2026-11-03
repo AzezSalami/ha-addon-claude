@@ -66,10 +66,18 @@ Apps like Tandoor's AI import expect the reply to be one JSON object. With `clea
 that parses as JSON is tidied before it is returned: a surrounding code fence is removed, and a list holding a single
 object is unwrapped to that object. Replies that are not JSON are never changed.
 
-## Troubleshooting
+## Logging requests
 
-Turn on `debug_log` to write the first 200 characters of every prompt and reply to the add-on log. Prompts and replies
-then appear in the log, so turn it off again afterwards.
+The `log_requests` option controls what is written to the add-on log (Settings → Add-ons → Claude API → Log):
+
+- `off` (default): only errors and one `... ok in Nms` line per successful request.
+- `summary`: one line per request with the method, path, status, duration, client address and request size.
+- `full`: the summary line plus the complete request body, the complete response body, the final prompt sent to Claude
+  (including any YouTube transcripts that were added) and Claude's raw reply before JSON tidying. Each block is cut at
+  50,000 characters.
+
+`Authorization` and `x-api-key` headers are never logged, but recipes, prompts and replies are, so use `full` only
+while troubleshooting and set it back to `off` afterwards. `/health` checks are not logged.
 
 ## Home Assistant example
 

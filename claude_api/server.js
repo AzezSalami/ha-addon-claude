@@ -11,7 +11,9 @@ const PORT = 8099;
 const FETCH_CAPTIONS = process.env.FETCH_CAPTIONS === 'true';
 const CAPTION_LANGS = process.env.CAPTION_LANGS || 'en.*';
 const CLEAN_JSON = process.env.CLEAN_JSON !== 'false';
-const DEBUG_LOG = process.env.DEBUG_LOG === 'true';
+// off: nothing extra. summary: one line per request. full: also the complete request, reply and prompt text.
+const LOG_MODE = ['summary', 'full'].includes(process.env.LOG_MODE) ? process.env.LOG_MODE : 'off';
+const MAX_LOGGED_CHARS = 50000;
 const MAX_TRANSCRIPT_CHARS = 60000;
 const MAX_VIDEOS = 3;
 // Only YouTube links are matched, and yt-dlp is given a URL rebuilt from the 11-character video id.
@@ -56,7 +58,10 @@ function readBody(req) {
       }
       chunks.push(c);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('end', () => {
+      req.rawBody = Buffer.concat(chunks).toString('utf8');
+      resolve(req.rawBody);
+    });
     req.on('error', reject);
   });
 }
@@ -133,16 +138,44 @@ function tidyJson(text) {
   return fenced ? body : text;
 }
 
-function preview(text) {
-  const flat = String(text).replace(/\s+/g, ' ');
-  return flat.length > 200 ? `${flat.slice(0, 200)}... (${flat.length} chars)` : flat;
+function logBlock(label, text) {
+  const s = String(text);
+  const body = s.length > MAX_LOGGED_CHARS ? `${s.slice(0, MAX_LOGGED_CHARS)}\n... (${s.length - MAX_LOGGED_CHARS} more characters not shown)` : s;
+  log(`${label}:\n${body}`);
+}
+
+// Logs one line per request (summary) or the whole exchange (full). Authorization headers are never logged.
+function attachRequestLog(req, res) {
+  if (LOG_MODE === 'off') return;
+  const started = Date.now();
+  const sent = [];
+  if (LOG_MODE === 'full') {
+    const write = res.write.bind(res);
+    const end = res.end.bind(res);
+    res.write = (chunk, ...rest) => {
+      if (chunk) sent.push(Buffer.from(chunk));
+      return write(chunk, ...rest);
+    };
+    res.end = (chunk, ...rest) => {
+      if (chunk && typeof chunk !== 'function') sent.push(Buffer.from(chunk));
+      return end(chunk, ...rest);
+    };
+  }
+  res.on('finish', () => {
+    const from = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+    log(`${req.method} ${req.url} -> ${res.statusCode} in ${Date.now() - started}ms (from ${from}, request ${(req.rawBody || '').length} chars)`);
+    if (LOG_MODE === 'full') {
+      if (req.rawBody) logBlock('  request body', req.rawBody);
+      logBlock('  response body', Buffer.concat(sent).toString('utf8'));
+    }
+  });
 }
 
 async function runClaude(opts) {
   const prompt = await withTranscripts(opts.prompt);
-  if (DEBUG_LOG) log(`prompt: ${preview(prompt)}`);
+  if (LOG_MODE === 'full') logBlock('  prompt sent to claude' + (opts.system ? ` (system: ${opts.system.length} chars)` : ''), prompt);
   const out = await spawnClaude({ ...opts, prompt });
-  if (DEBUG_LOG) log(`reply: ${preview(out.result)}`);
+  if (LOG_MODE === 'full') logBlock('  raw reply from claude', out.result);
   if (CLEAN_JSON && typeof out.result === 'string') {
     const tidy = tidyJson(out.result);
     if (tidy !== out.result) {
@@ -336,6 +369,7 @@ const server = http.createServer(async (req, res) => {
     const path = req.url.split('?')[0].replace(/\/+/g, '/').replace(/^(\/v1)+/, '/v1');
 
     if (req.method === 'GET' && path === '/health') return send(res, 200, { ok: true });
+    attachRequestLog(req, res);
     if (!authorized(req)) {
       return path === '/v1/messages' ? anthropicError(res, 401, 'unauthorized') : send(res, 401, { error: 'unauthorized' });
     }

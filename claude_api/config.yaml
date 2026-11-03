@@ -1,5 +1,5 @@
 name: Claude API
-version: "0.5.0"
+version: "0.6.0"
 slug: claude_api
 description: Local HTTP API in front of the Claude Code CLI, using your own Claude Pro login.
 url: https://github.com/AzezSalami/ha-addon-claude
@@ -23,7 +23,7 @@ options:
   fetch_youtube_captions: true
   caption_languages: "en.*"
   clean_json_replies: true
-  debug_log: false
+  log_requests: "off"
 schema:
   api_token: password
   oauth_token: password?
@@ -33,4 +33,4 @@ schema:
   fetch_youtube_captions: bool
   caption_languages: str
   clean_json_replies: bool
-  debug_log: bool
+  log_requests: list(off|summary|full)
