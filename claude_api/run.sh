@@ -12,6 +12,8 @@ export DEFAULT_MODEL="$(jq -r '.default_model // ""' "$OPTIONS")"
 export TIMEOUT_SECONDS="$(jq -r '.timeout_seconds' "$OPTIONS")"
 export MAX_CONCURRENT="$(jq -r '.max_concurrent' "$OPTIONS")"
 export FETCH_CAPTIONS="$(jq -r '.fetch_youtube_captions' "$OPTIONS")"
+export CLEAN_JSON="$(jq -r '.clean_json_replies' "$OPTIONS")"
+export DEBUG_LOG="$(jq -r '.debug_log' "$OPTIONS")"
 export CAPTION_LANGS="$(jq -r '.caption_languages // "en.*"' "$OPTIONS")"
 
 OAUTH_TOKEN="$(jq -r '.oauth_token // ""' "$OPTIONS")"

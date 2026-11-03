@@ -60,6 +60,17 @@ endpoint. Up to 3 videos per request, and each transcript is cut at 60,000 chara
   from time to time: rebuilding the add-on installs the latest version.
 - Claude only sees what is said, not what is shown on screen.
 
+## JSON replies
+
+Apps like Tandoor's AI import expect the reply to be one JSON object. With `clean_json_replies` on (the default), a reply
+that parses as JSON is tidied before it is returned: a surrounding code fence is removed, and a list holding a single
+object is unwrapped to that object. Replies that are not JSON are never changed.
+
+## Troubleshooting
+
+Turn on `debug_log` to write the first 200 characters of every prompt and reply to the add-on log. Prompts and replies
+then appear in the log, so turn it off again afterwards.
+
 ## Home Assistant example
 
 ```yaml

@@ -10,6 +10,8 @@ const { spawn, execFile } = require('child_process');
 const PORT = 8099;
 const FETCH_CAPTIONS = process.env.FETCH_CAPTIONS === 'true';
 const CAPTION_LANGS = process.env.CAPTION_LANGS || 'en.*';
+const CLEAN_JSON = process.env.CLEAN_JSON !== 'false';
+const DEBUG_LOG = process.env.DEBUG_LOG === 'true';
 const MAX_TRANSCRIPT_CHARS = 60000;
 const MAX_VIDEOS = 3;
 // Only YouTube links are matched, and yt-dlp is given a URL rebuilt from the 11-character video id.
@@ -112,8 +114,43 @@ async function withTranscripts(prompt) {
   return `${prompt}\n\n${parts.join('\n\n')}`;
 }
 
+// Apps that parse replies as JSON break on markdown fences or a one-item array wrapped around the object.
+// Anything that does not parse as JSON is returned untouched.
+function tidyJson(text) {
+  let body = text.trim();
+  const fenced = body.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/i);
+  if (fenced) body = fenced[1].trim();
+  if (!/^[[{]/.test(body)) return text;
+  let parsed;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return text;
+  }
+  if (Array.isArray(parsed) && parsed.length === 1 && parsed[0] && typeof parsed[0] === 'object' && !Array.isArray(parsed[0])) {
+    return JSON.stringify(parsed[0]);
+  }
+  return fenced ? body : text;
+}
+
+function preview(text) {
+  const flat = String(text).replace(/\s+/g, ' ');
+  return flat.length > 200 ? `${flat.slice(0, 200)}... (${flat.length} chars)` : flat;
+}
+
 async function runClaude(opts) {
-  return spawnClaude({ ...opts, prompt: await withTranscripts(opts.prompt) });
+  const prompt = await withTranscripts(opts.prompt);
+  if (DEBUG_LOG) log(`prompt: ${preview(prompt)}`);
+  const out = await spawnClaude({ ...opts, prompt });
+  if (DEBUG_LOG) log(`reply: ${preview(out.result)}`);
+  if (CLEAN_JSON && typeof out.result === 'string') {
+    const tidy = tidyJson(out.result);
+    if (tidy !== out.result) {
+      log('JSON reply tidied (removed code fence or unwrapped single-item array)');
+      out.result = tidy;
+    }
+  }
+  return out;
 }
 
 function spawnClaude({ prompt, system, model, sessionId }) {
