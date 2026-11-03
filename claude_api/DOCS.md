@@ -56,9 +56,27 @@ endpoint. Up to 3 videos per request, and each transcript is cut at 60,000 chara
   example `de.*,en.*`).
 - Manual and auto-generated captions are both used. A video with no captions at all gets a note saying so, and Claude is
   not given a transcript.
-- Only YouTube is supported. YouTube sometimes blocks `yt-dlp` from server addresses, and the tool needs updating
+- This part covers YouTube only; see "Instagram links" below for Instagram. YouTube sometimes blocks `yt-dlp` from server addresses, and the tool needs updating
   from time to time: rebuilding the add-on installs the latest version.
 - Claude only sees what is said, not what is shown on screen.
+
+## Instagram links
+
+When a prompt contains an Instagram post or reel link (`instagram.com/reel/...`, `/reels/...`, `/p/...` or `/tv/...`)
+and `fetch_instagram_captions` is on (the default), the add-on reads the post's **caption** with `yt-dlp` and appends it
+to the prompt. This is the text the author wrote under the post. Instagram has no subtitles, so anything that is only
+spoken in the video is not available: a post whose caption says "recipe in the video" gives Claude nothing to work with.
+
+Instagram usually refuses requests that are not logged in, so many fetches fail without cookies. The failure is reported
+to Claude and shown in the add-on log, and Claude is not given a made-up caption. To log in:
+
+1. Use a throwaway Instagram account, not your main one: scraping is against Instagram's terms and can get an account
+   restricted.
+2. Log in to that account in a desktop browser and export its cookies in Netscape format with a cookies.txt extension.
+3. Save the file as `instagram_cookies.txt` in the add-on config folder (`/addon_configs/<id>_claude_api/`, reachable
+   from the File editor or Samba add-ons). The add-on uses it automatically if it exists, and never modifies it.
+
+The cookie file is a copy of a logged-in session: keep it private, and delete it to stop using it.
 
 ## JSON replies
 

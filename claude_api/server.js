@@ -18,6 +18,10 @@ const MAX_TRANSCRIPT_CHARS = 60000;
 const MAX_VIDEOS = 3;
 // Only YouTube links are matched, and yt-dlp is given a URL rebuilt from the 11-character video id.
 const YOUTUBE_RE = /(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?(?:[^\s]*&)?v=|shorts\/|live\/)|youtu\.be\/)([\w-]{11})/g;
+const FETCH_INSTAGRAM = process.env.FETCH_INSTAGRAM === 'true';
+const INSTAGRAM_COOKIES = process.env.INSTAGRAM_COOKIES_FILE || '/config/instagram_cookies.txt';
+// Post and reel links only; yt-dlp is given a URL rebuilt from the link kind and shortcode.
+const INSTAGRAM_RE = /instagram\.com\/(?:[\w.]+\/)?(reels?|p|tv)\/([\w-]+)/gi;
 const API_TOKEN = process.env.API_TOKEN;
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || '';
 const TIMEOUT_MS = Number(process.env.TIMEOUT_SECONDS || 120) * 1000;
@@ -99,21 +103,62 @@ async function fetchCaptions(id) {
   }
 }
 
-// Claude cannot watch video, so the captions of any YouTube links in the prompt are appended to it.
+// The caption is the text the author wrote under the post; Instagram has no subtitle track for what is said in the video.
+async function fetchInstagramCaption(kind, code) {
+  const dir = fs.mkdtempSync(join(os.tmpdir(), 'ig-'));
+  try {
+    const args = ['--skip-download', '--no-playlist', '--print', 'description'];
+    if (fs.existsSync(INSTAGRAM_COOKIES)) {
+      // yt-dlp rewrites its cookie file, so it gets a throwaway copy.
+      const copy = join(dir, 'cookies.txt');
+      fs.copyFileSync(INSTAGRAM_COOKIES, copy);
+      args.push('--cookies', copy);
+    }
+    args.push('--', `https://www.instagram.com/${kind}/${code}/`);
+    const stdout = await new Promise((resolve, reject) => {
+      execFile('yt-dlp', args, { timeout: 30000, cwd: dir, maxBuffer: 4 * 1024 * 1024 }, (err, out, stderr) => {
+        if (!err) return resolve(out);
+        let msg = String(stderr || err.message).trim().split('\n').pop();
+        if (/login|log in|cookie|rate-limit|empty media|private/i.test(msg)) {
+          msg += ' (Instagram usually needs a login: see "Instagram links" in the add-on documentation)';
+        }
+        reject(new Error(msg));
+      });
+    });
+    const text = stdout.trim();
+    if (!text || text === 'NA') throw new Error('the post has no caption');
+    return text.slice(0, MAX_TRANSCRIPT_CHARS);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// Claude cannot watch video, so the captions of any YouTube links, and the post captions of any Instagram links,
+// found in the prompt are appended to it.
 async function withTranscripts(prompt) {
-  if (!FETCH_CAPTIONS) return prompt;
-  const ids = [...new Set([...prompt.matchAll(YOUTUBE_RE)].map((m) => m[1]))].slice(0, MAX_VIDEOS);
-  if (ids.length === 0) return prompt;
+  const jobs = [];
+  if (FETCH_CAPTIONS) {
+    for (const m of prompt.matchAll(YOUTUBE_RE)) {
+      jobs.push({ key: `yt:${m[1]}`, url: `https://www.youtube.com/watch?v=${m[1]}`, what: 'Transcript', run: () => fetchCaptions(m[1]) });
+    }
+  }
+  if (FETCH_INSTAGRAM) {
+    for (const m of prompt.matchAll(INSTAGRAM_RE)) {
+      const kind = m[1].toLowerCase() === 'reels' ? 'reel' : m[1].toLowerCase();
+      jobs.push({ key: `ig:${m[2]}`, url: `https://www.instagram.com/${kind}/${m[2]}/`, what: 'Caption', run: () => fetchInstagramCaption(kind, m[2]) });
+    }
+  }
+  const unique = [...new Map(jobs.map((j) => [j.key, j])).values()].slice(0, MAX_VIDEOS);
+  if (unique.length === 0) return prompt;
   const parts = [];
-  for (const id of ids) {
-    const url = `https://www.youtube.com/watch?v=${id}`;
+  for (const job of unique) {
     try {
-      const text = await fetchCaptions(id);
-      log(`captions ok for ${id} (${text.length} chars)`);
-      parts.push(`[Transcript of ${url}]\n${text}`);
+      const text = await job.run();
+      log(`${job.what.toLowerCase()} ok for ${job.key} (${text.length} chars)`);
+      parts.push(`[${job.what} of ${job.url}]\n${text}`);
     } catch (e) {
-      log(`captions failed for ${id}: ${e.message}`);
-      parts.push(`[Captions for ${url} could not be fetched: ${e.message}]`);
+      log(`${job.what.toLowerCase()} failed for ${job.key}: ${e.message}`);
+      parts.push(`[${job.what} of ${job.url} could not be fetched: ${e.message}]`);
     }
   }
   return `${prompt}\n\n${parts.join('\n\n')}`;

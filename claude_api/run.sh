@@ -14,6 +14,7 @@ export MAX_CONCURRENT="$(jq -r '.max_concurrent' "$OPTIONS")"
 export FETCH_CAPTIONS="$(jq -r '.fetch_youtube_captions' "$OPTIONS")"
 export CLEAN_JSON="$(jq -r '.clean_json_replies' "$OPTIONS")"
 export LOG_MODE="$(jq -r '.log_requests // "off"' "$OPTIONS")"
+export FETCH_INSTAGRAM="$(jq -r '.fetch_instagram_captions' "$OPTIONS")"
 export CAPTION_LANGS="$(jq -r '.caption_languages // "en.*"' "$OPTIONS")"
 
 OAUTH_TOKEN="$(jq -r '.oauth_token // ""' "$OPTIONS")"
