@@ -62,9 +62,18 @@ endpoint. Up to 3 videos per request, and each transcript is cut at 60,000 chara
 
 ## JSON replies
 
-Apps like Tandoor's AI import expect the reply to be one JSON object. With `clean_json_replies` on (the default), a reply
-that parses as JSON is tidied before it is returned: a surrounding code fence is removed, and a list holding a single
-object is unwrapped to that object. Replies that are not JSON are never changed.
+Apps like Tandoor's AI import expect the reply to be one JSON object. With `clean_json_replies` on (the default):
+
+- A request that asks for JSON (for example "return ... as JSON" or "schema.org") gets an instruction added at the end of
+  the prompt telling Claude to reply with raw JSON only, with no code fence and no explanations. If the request mentions
+  `schema.org/recipe`, the instruction also asks for exactly one Recipe object: when a video or page contains several
+  recipes they are merged into one, with each part as its own section.
+- The reply is then tidied before it is returned: the code fence (closed or not) and any text around it are removed
+  (for requests that asked for JSON), a list holding a single object is unwrapped to that object, and a reply that was
+  cut off mid-way is repaired by closing its open brackets and dropping a dangling comma. The add-on log says when a
+  repair happened, and warns when the reply is a list of several items.
+
+Replies that cannot be read as JSON are never changed. A repaired reply may be missing whatever was cut off.
 
 ## Logging requests
 

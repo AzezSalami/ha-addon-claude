@@ -119,23 +119,76 @@ async function withTranscripts(prompt) {
   return `${prompt}\n\n${parts.join('\n\n')}`;
 }
 
-// Apps that parse replies as JSON break on markdown fences or a one-item array wrapped around the object.
-// Anything that does not parse as JSON is returned untouched.
-function tidyJson(text) {
-  let body = text.trim();
-  const fenced = body.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/i);
-  if (fenced) body = fenced[1].trim();
-  if (!/^[[{]/.test(body)) return text;
-  let parsed;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return text;
+// Added to requests that ask for JSON, so the reply needs less cleaning up afterwards.
+const JSON_REQUEST_RE = /(respond|reply|return|output|answer|format)[^.\n]{0,60}json|json (object|format|only)|schema\.org/i;
+const RECIPE_REQUEST_RE = /schema\.org\/recipe/i;
+// Appended to the end of the prompt itself: Claude follows it there more reliably than in a system prompt.
+const JSON_RULE =
+  '[Output format] Reply with one single raw JSON value only: no markdown code fences, no text before or after the JSON, ' +
+  'no explanations or notes.';
+const RECIPE_RULE =
+  'The JSON must be exactly one Recipe object, never an array. If the text contains several recipes or parts, merge them ' +
+  'into that one Recipe and keep each part as its own named section (a HowToSection in recipeInstructions, and a heading ' +
+  'line such as "Crust:" in recipeIngredient).';
+
+// Closes strings, objects and arrays left open (for example by a cut-off reply) and drops a dangling comma.
+function repairJson(body) {
+  let out = '';
+  const stack = [];
+  let inString = false;
+  let escaped = false;
+  for (const ch of body) {
+    out += ch;
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{') stack.push('}');
+    else if (ch === '[') stack.push(']');
+    else if (ch === '}' || ch === ']') stack.pop();
   }
+  if (inString) out += '"';
+  return out.replace(/,\s*$/, '') + stack.reverse().join('');
+}
+
+// Finds the JSON part of a reply: a ```json fence (closed or not), or the whole reply. When the request did not ask for
+// JSON, a fence surrounded by a lot of prose is left alone because it is probably an ordinary answer with an example.
+function extractJson(text, jsonRequested) {
+  const fence = text.match(/```(?:json)?[ \t]*\r?\n([\s\S]*?)(?:\r?\n[ \t]*```|$)/i);
+  if (fence && !jsonRequested && text.length - fence[0].length > 300) return null;
+  const body = (fence ? fence[1] : text).trim();
+  return /^[[{]/.test(body) ? { body, fenced: Boolean(fence) } : null;
+}
+
+// Apps that parse replies as JSON break on code fences, a cut-off reply or a one-item array wrapped around the object.
+// Anything that cannot be read as JSON is returned untouched.
+function tidyJson(text, jsonRequested) {
+  const found = extractJson(text, jsonRequested);
+  if (!found) return text;
+  let parsed;
+  let repaired = false;
+  try {
+    parsed = JSON.parse(found.body);
+  } catch {
+    try {
+      parsed = JSON.parse(repairJson(found.body).replace(/,(\s*[}\]])/g, '$1'));
+      repaired = true;
+    } catch {
+      return text;
+    }
+  }
+  if (repaired) log('JSON reply was incomplete; closed the open brackets');
   if (Array.isArray(parsed) && parsed.length === 1 && parsed[0] && typeof parsed[0] === 'object' && !Array.isArray(parsed[0])) {
     return JSON.stringify(parsed[0]);
   }
-  return fenced ? body : text;
+  if (Array.isArray(parsed) && parsed.length > 1) {
+    log(`JSON reply is a list of ${parsed.length} items; apps that expect a single object will reject it`);
+  }
+  if (repaired) return JSON.stringify(parsed);
+  return found.fenced || found.body !== text.trim() ? found.body : text;
 }
 
 function logBlock(label, text) {
@@ -172,12 +225,16 @@ function attachRequestLog(req, res) {
 }
 
 async function runClaude(opts) {
-  const prompt = await withTranscripts(opts.prompt);
+  let prompt = await withTranscripts(opts.prompt);
+  const asksForJson = CLEAN_JSON && JSON_REQUEST_RE.test(`${opts.system || ''}\n${opts.prompt}`);
+  if (asksForJson) {
+    prompt += `\n\n${JSON_RULE}${RECIPE_REQUEST_RE.test(opts.prompt) ? ` ${RECIPE_RULE}` : ''}`;
+  }
   if (LOG_MODE === 'full') logBlock('  prompt sent to claude' + (opts.system ? ` (system: ${opts.system.length} chars)` : ''), prompt);
   const out = await spawnClaude({ ...opts, prompt });
   if (LOG_MODE === 'full') logBlock('  raw reply from claude', out.result);
   if (CLEAN_JSON && typeof out.result === 'string') {
-    const tidy = tidyJson(out.result);
+    const tidy = tidyJson(out.result, asksForJson);
     if (tidy !== out.result) {
       log('JSON reply tidied (removed code fence or unwrapped single-item array)');
       out.result = tidy;
