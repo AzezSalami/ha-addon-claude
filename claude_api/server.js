@@ -2,9 +2,18 @@
 
 const http = require('http');
 const crypto = require('crypto');
-const { spawn } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const { join } = require('path');
+const { spawn, execFile } = require('child_process');
 
 const PORT = 8099;
+const FETCH_CAPTIONS = process.env.FETCH_CAPTIONS === 'true';
+const CAPTION_LANGS = process.env.CAPTION_LANGS || 'en.*';
+const MAX_TRANSCRIPT_CHARS = 60000;
+const MAX_VIDEOS = 3;
+// Only YouTube links are matched, and yt-dlp is given a URL rebuilt from the 11-character video id.
+const YOUTUBE_RE = /(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?(?:[^\s]*&)?v=|shorts\/|live\/)|youtu\.be\/)([\w-]{11})/g;
 const API_TOKEN = process.env.API_TOKEN;
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || '';
 const TIMEOUT_MS = Number(process.env.TIMEOUT_SECONDS || 120) * 1000;
@@ -50,7 +59,64 @@ function readBody(req) {
   });
 }
 
-function runClaude({ prompt, system, model, sessionId }) {
+function vttToText(vtt) {
+  const lines = [];
+  for (const raw of vtt.split(/\r?\n/)) {
+    const line = raw.replace(/<[^>]+>/g, '').trim();
+    if (!line || line === 'WEBVTT' || /^(Kind|Language|NOTE)\b/.test(line) || line.includes('-->')) continue;
+    // Auto-generated captions repeat each line across overlapping cues.
+    if (lines[lines.length - 1] !== line) lines.push(line);
+  }
+  return lines.join(' ');
+}
+
+async function fetchCaptions(id) {
+  const dir = fs.mkdtempSync(join(os.tmpdir(), 'yt-'));
+  try {
+    const args = [
+      '--skip-download', '--write-subs', '--write-auto-subs', '--sub-langs', CAPTION_LANGS,
+      '--sub-format', 'vtt', '--no-playlist', '-o', join(dir, '%(id)s'), '--',
+      `https://www.youtube.com/watch?v=${id}`,
+    ];
+    await new Promise((resolve, reject) => {
+      execFile('yt-dlp', args, { timeout: 30000, cwd: dir }, (err, stdout, stderr) => {
+        if (err) reject(new Error(String(stderr || err.message).trim().split('\n').pop()));
+        else resolve();
+      });
+    });
+    const file = fs.readdirSync(dir).filter((f) => f.endsWith('.vtt')).sort()[0];
+    if (!file) throw new Error('no captions available');
+    return vttToText(fs.readFileSync(join(dir, file), 'utf8')).slice(0, MAX_TRANSCRIPT_CHARS);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// Claude cannot watch video, so the captions of any YouTube links in the prompt are appended to it.
+async function withTranscripts(prompt) {
+  if (!FETCH_CAPTIONS) return prompt;
+  const ids = [...new Set([...prompt.matchAll(YOUTUBE_RE)].map((m) => m[1]))].slice(0, MAX_VIDEOS);
+  if (ids.length === 0) return prompt;
+  const parts = [];
+  for (const id of ids) {
+    const url = `https://www.youtube.com/watch?v=${id}`;
+    try {
+      const text = await fetchCaptions(id);
+      log(`captions ok for ${id} (${text.length} chars)`);
+      parts.push(`[Transcript of ${url}]\n${text}`);
+    } catch (e) {
+      log(`captions failed for ${id}: ${e.message}`);
+      parts.push(`[Captions for ${url} could not be fetched: ${e.message}]`);
+    }
+  }
+  return `${prompt}\n\n${parts.join('\n\n')}`;
+}
+
+async function runClaude(opts) {
+  return spawnClaude({ ...opts, prompt: await withTranscripts(opts.prompt) });
+}
+
+function spawnClaude({ prompt, system, model, sessionId }) {
   return new Promise((resolve, reject) => {
     // Built-in tools are disabled: this endpoint is a plain text API, not an agent with shell access.
     const args = ['-p', '--output-format', 'json', '--tools', ''];

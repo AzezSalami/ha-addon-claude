@@ -4,9 +4,10 @@ FROM node:22-bookworm-slim
 
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates jq tini; \
+    apt-get install -y --no-install-recommends ca-certificates jq tini python3 python3-pip; \
     rm -rf /var/lib/apt/lists/*; \
-    npm install -g @anthropic-ai/claude-code
+    npm install -g @anthropic-ai/claude-code; \
+    pip3 install --no-cache-dir --break-system-packages yt-dlp
 
 COPY server.js /app/server.js
 COPY run.sh /run.sh

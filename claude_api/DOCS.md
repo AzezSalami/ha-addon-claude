@@ -46,6 +46,20 @@ without `/v1` (`http://<ha-host>:8099`), because the client appends `/v1/message
 Supported: `POST /v1/chat/completions` (including `stream: true`, which returns the full reply as one chunk) and `GET /v1/models`.
 Tool calling and image input are not supported.
 
+## YouTube links
+
+Claude cannot watch video, so when a prompt contains a YouTube link (`youtube.com/watch`, `youtu.be`, Shorts or live URLs)
+the add-on fetches the video's captions with `yt-dlp` and appends the transcript to the prompt. This works on every
+endpoint. Up to 3 videos per request, and each transcript is cut at 60,000 characters.
+
+- Options: `fetch_youtube_captions` (on by default) and `caption_languages` (a `yt-dlp` pattern, default `en.*`; for
+  example `de.*,en.*`).
+- Manual and auto-generated captions are both used. A video with no captions at all gets a note saying so, and Claude is
+  not given a transcript.
+- Only YouTube is supported. YouTube sometimes blocks `yt-dlp` from server addresses, and the tool needs updating
+  from time to time: rebuilding the add-on installs the latest version.
+- Claude only sees what is said, not what is shown on screen.
+
 ## Home Assistant example
 
 ```yaml

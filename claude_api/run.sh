@@ -11,6 +11,8 @@ export API_TOKEN="$(jq -r '.api_token' "$OPTIONS")"
 export DEFAULT_MODEL="$(jq -r '.default_model // ""' "$OPTIONS")"
 export TIMEOUT_SECONDS="$(jq -r '.timeout_seconds' "$OPTIONS")"
 export MAX_CONCURRENT="$(jq -r '.max_concurrent' "$OPTIONS")"
+export FETCH_CAPTIONS="$(jq -r '.fetch_youtube_captions' "$OPTIONS")"
+export CAPTION_LANGS="$(jq -r '.caption_languages // "en.*"' "$OPTIONS")"
 
 OAUTH_TOKEN="$(jq -r '.oauth_token // ""' "$OPTIONS")"
 if [ -n "$OAUTH_TOKEN" ]; then
