@@ -30,6 +30,17 @@ Response:
 
 Pass the returned `session_id` back to continue a conversation. `GET /health` needs no token.
 
+## OpenAI-compatible API
+
+For apps that speak the OpenAI protocol (Open WebUI, LiteLLM and similar):
+
+- Base URL: `http://<ha-host>:8099/v1`
+- API key: your `api_token`
+- Model: any name. Names starting with `claude`, `sonnet`, `opus`, `haiku` or `fable` are passed to the CLI; anything else uses `default_model`.
+
+Supported: `POST /v1/chat/completions` (including `stream: true`, which returns the full reply as one chunk) and `GET /v1/models`.
+Tool calling and image input are not supported.
+
 ## Home Assistant example
 
 ```yaml

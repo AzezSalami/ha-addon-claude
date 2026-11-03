@@ -105,10 +105,103 @@ function schedule(job) {
   });
 }
 
+function contentText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map((p) => (typeof p === 'string' ? p : p && p.type === 'text' ? p.text : '')).join('\n');
+  }
+  return '';
+}
+
+// OpenAI clients send arbitrary model names; only pass through ones the CLI understands.
+function cliModel(name) {
+  return typeof name === 'string' && /^(claude|sonnet|opus|haiku|fable)/i.test(name) ? name : '';
+}
+
+function openaiError(res, status, message) {
+  send(res, status, { error: { message, type: 'invalid_request_error' } });
+}
+
+async function chatCompletions(req, res, body) {
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    return openaiError(res, 400, 'messages (array) is required');
+  }
+  const systems = [];
+  const turns = [];
+  for (const m of body.messages) {
+    const text = contentText(m.content);
+    if (m.role === 'system' || m.role === 'developer') systems.push(text);
+    else turns.push({ role: m.role === 'assistant' ? 'Assistant' : 'User', text });
+  }
+  const wantsJson = body.response_format && body.response_format.type !== 'text';
+  if (wantsJson) systems.push('Respond with only valid JSON, no markdown fences and no commentary.');
+
+  // A single user turn is sent as-is; longer histories are flattened into a transcript.
+  const prompt =
+    turns.length === 1 && turns[0].role === 'User'
+      ? turns[0].text
+      : turns.map((t) => `${t.role}: ${t.text}`).join('\n\n') + '\n\nAssistant:';
+
+  const out = await schedule(() =>
+    runClaude({ prompt, system: systems.join('\n\n'), model: cliModel(body.model) })
+  );
+
+  const id = `chatcmpl-${crypto.randomBytes(8).toString('hex')}`;
+  const created = Math.floor(Date.now() / 1000);
+  const model = body.model || 'claude';
+  const usage = {
+    prompt_tokens: (out.usage && out.usage.input_tokens) || 0,
+    completion_tokens: (out.usage && out.usage.output_tokens) || 0,
+    total_tokens: ((out.usage && out.usage.input_tokens) || 0) + ((out.usage && out.usage.output_tokens) || 0),
+  };
+
+  if (body.stream) {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+    const chunk = (delta, finish) =>
+      `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+    res.write(chunk({ role: 'assistant', content: out.result }, null));
+    res.write(chunk({}, 'stop'));
+    res.end('data: [DONE]\n\n');
+    return;
+  }
+
+  send(res, 200, {
+    id,
+    object: 'chat.completion',
+    created,
+    model,
+    choices: [{ index: 0, message: { role: 'assistant', content: out.result }, finish_reason: 'stop' }],
+    usage,
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && req.url === '/health') return send(res, 200, { ok: true });
     if (!authorized(req)) return send(res, 401, { error: 'unauthorized' });
+
+    if (req.method === 'GET' && req.url === '/v1/models') {
+      return send(res, 200, { object: 'list', data: [{ id: 'claude', object: 'model', owned_by: 'anthropic' }] });
+    }
+
+    if (req.method === 'POST' && req.url === '/v1/chat/completions') {
+      let body;
+      try {
+        body = JSON.parse(await readBody(req));
+      } catch (e) {
+        return openaiError(res, e.status || 400, e.status ? e.message : 'invalid JSON');
+      }
+      try {
+        const started = Date.now();
+        await chatCompletions(req, res, body);
+        log(`chat ok in ${Date.now() - started}ms`);
+      } catch (e) {
+        log(`error: ${e.message}`);
+        if (!res.headersSent) openaiError(res, e.status || 500, e.message);
+        else res.end();
+      }
+      return;
+    }
 
     if (req.method === 'POST' && req.url === '/v1/ask') {
       let body;

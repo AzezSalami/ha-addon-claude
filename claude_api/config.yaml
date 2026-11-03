@@ -1,5 +1,5 @@
 name: Claude API
-version: "0.1.0"
+version: "0.2.0"
 slug: claude_api
 description: Local HTTP API in front of the Claude Code CLI, using your own Claude Pro login.
 url: https://github.com/AzezSalami/ha-addon-claude
