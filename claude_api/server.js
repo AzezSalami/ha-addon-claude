@@ -22,6 +22,14 @@ const FETCH_INSTAGRAM = process.env.FETCH_INSTAGRAM === 'true';
 const INSTAGRAM_COOKIES = process.env.INSTAGRAM_COOKIES_FILE || '/config/instagram_cookies.txt';
 // Post and reel links only; yt-dlp is given a URL rebuilt from the link kind and shortcode.
 const INSTAGRAM_RE = /instagram\.com\/(?:[\w.]+\/)?(reels?|p|tv)\/([\w-]+)/gi;
+// Requests under /voice/ get replies written for speaking. These replace Claude Code's own coding-focused system prompt.
+const VOICE_RULES =
+  process.env.VOICE_INSTRUCTIONS ||
+  'You are a voice assistant in a home, and everything you write is read aloud by a text-to-speech engine. ' +
+    'Answer in one or two short, natural sentences unless asked for more detail. ' +
+    'Use plain spoken language only: no markdown, lists, headings, emoji, code or URLs. ' +
+    'Write numbers and units the way they are said. Reply in the language the user speaks.';
+const VOICE_MEMORY_MS = Number(process.env.VOICE_MEMORY_MINUTES || 0) * 60000;
 const API_TOKEN = process.env.API_TOKEN;
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || '';
 const TIMEOUT_MS = Number(process.env.TIMEOUT_SECONDS || 120) * 1000;
@@ -271,7 +279,7 @@ function attachRequestLog(req, res) {
 
 async function runClaude(opts) {
   let prompt = await withTranscripts(opts.prompt);
-  const asksForJson = CLEAN_JSON && JSON_REQUEST_RE.test(`${opts.system || ''}\n${opts.prompt}`);
+  const asksForJson = CLEAN_JSON && !opts.voice && JSON_REQUEST_RE.test(`${opts.system || ''}\n${opts.prompt}`);
   if (asksForJson) {
     prompt += `\n\n${JSON_RULE}${RECIPE_REQUEST_RE.test(opts.prompt) ? ` ${RECIPE_RULE}` : ''}`;
   }
@@ -280,7 +288,7 @@ async function runClaude(opts) {
   const onDelta = asksForJson ? undefined : opts.onDelta;
   const out = await spawnClaude({ ...opts, prompt, onDelta });
   if (LOG_MODE === 'full') logBlock('  raw reply from claude', out.result);
-  if (!out.streamed && CLEAN_JSON && typeof out.result === 'string') {
+  if (!out.streamed && !opts.voice && CLEAN_JSON && typeof out.result === 'string') {
     const tidy = tidyJson(out.result, asksForJson);
     if (tidy !== out.result) {
       log('JSON reply tidied (removed code fence or unwrapped single-item array)');
@@ -292,14 +300,14 @@ async function runClaude(opts) {
 
 // With onDelta, the CLI runs in stream-json mode and onDelta(text) is called for every piece of text as it is generated.
 // The promise still resolves with the complete reply. `signal` kills the process, e.g. when the client disconnects.
-function spawnClaude({ prompt, system, model, sessionId, onDelta, signal }) {
+function spawnClaude({ prompt, system, model, sessionId, onDelta, signal, voice }) {
   return new Promise((resolve, reject) => {
     // Built-in tools are disabled: this endpoint is a plain text API, not an agent with shell access.
     const args = ['-p', '--output-format', onDelta ? 'stream-json' : 'json', '--tools', ''];
     if (onDelta) args.push('--verbose', '--include-partial-messages');
     const useModel = model || DEFAULT_MODEL;
     if (useModel) args.push('--model', useModel);
-    if (system) args.push('--append-system-prompt', system);
+    if (system) args.push(voice ? '--system-prompt' : '--append-system-prompt', system);
     if (sessionId) args.push('--resume', sessionId);
 
     const child = spawn('claude', args, { stdio: ['pipe', 'pipe', 'pipe'], cwd: '/tmp', signal });
@@ -405,6 +413,54 @@ function cliModel(name) {
   return typeof name === 'string' && /^(claude|sonnet|opus|haiku|fable)/i.test(name) ? name : '';
 }
 
+// A single user turn is sent as-is; longer histories are flattened into a transcript.
+function flattenTurns(turns) {
+  if (turns.length === 1 && turns[0].role === 'User') return turns[0].text;
+  return turns.map((t) => `${t.role}: ${t.text}`).join('\n\n') + '\n\nAssistant:';
+}
+
+const voiceSessions = new Map();
+
+function activeVoiceSession(key) {
+  const session = voiceSessions.get(key);
+  if (session && Date.now() - session.at <= VOICE_MEMORY_MS) return session.id;
+  voiceSessions.delete(key);
+  return null;
+}
+
+// Plain requests send the whole history they were given. Voice requests continue the stored CLI session while it is
+// fresh, sending only the newest user message, so the conversation survives clients that forget or send no history.
+async function converse({ turns, system, model, voiceKey, onDelta, signal }) {
+  if (!voiceKey) return runClaude({ prompt: flattenTurns(turns), system, model, onDelta, signal });
+
+  let spoke = false;
+  const opts = {
+    system: [VOICE_RULES, system].filter(Boolean).join('\n\n'),
+    model,
+    signal,
+    voice: true,
+    onDelta: onDelta && ((text) => {
+      spoke = true;
+      onDelta(text);
+    }),
+  };
+  const sessionId = activeVoiceSession(voiceKey);
+  const latest = [...turns].reverse().find((t) => t.role === 'User');
+  let out;
+  if (sessionId && latest) {
+    try {
+      out = await runClaude({ ...opts, prompt: latest.text, sessionId });
+    } catch (e) {
+      if (spoke || e.name === 'AbortError') throw e;
+      log(`could not continue voice session, starting a new one: ${e.message}`);
+      voiceSessions.delete(voiceKey);
+    }
+  }
+  if (!out) out = await runClaude({ ...opts, prompt: flattenTurns(turns) });
+  if (VOICE_MEMORY_MS > 0 && out.session_id) voiceSessions.set(voiceKey, { id: out.session_id, at: Date.now() });
+  return out;
+}
+
 function startEventStream(req, res) {
   req.socket.setNoDelay(true);
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' });
@@ -429,12 +485,6 @@ async function chatCompletions(req, res, body) {
   const wantsJson = body.response_format && body.response_format.type !== 'text';
   if (wantsJson) systems.push('Respond with only valid JSON, no markdown fences and no commentary.');
 
-  // A single user turn is sent as-is; longer histories are flattened into a transcript.
-  const prompt =
-    turns.length === 1 && turns[0].role === 'User'
-      ? turns[0].text
-      : turns.map((t) => `${t.role}: ${t.text}`).join('\n\n') + '\n\nAssistant:';
-
   const id = `chatcmpl-${crypto.randomBytes(8).toString('hex')}`;
   const created = Math.floor(Date.now() / 1000);
   const model = body.model || 'claude';
@@ -453,10 +503,11 @@ async function chatCompletions(req, res, body) {
   if (body.stream) res.on('close', () => !res.writableFinished && abort.abort());
 
   const out = await schedule(() =>
-    runClaude({
-      prompt,
+    converse({
+      turns,
       system: systems.join('\n\n'),
       model: cliModel(body.model),
+      voiceKey: req.voice ? String(body.user || 'default') : null,
       signal: abort.signal,
       onDelta: body.stream ? (text) => { begin(); res.write(chunk({ content: text }, null)); } : undefined,
     })
@@ -499,10 +550,6 @@ async function anthropicMessages(req, res, body) {
     return anthropicError(res, 400, 'messages (array) is required');
   }
   const turns = body.messages.map((m) => ({ role: m.role === 'assistant' ? 'Assistant' : 'User', text: contentText(m.content) }));
-  const prompt =
-    turns.length === 1 && turns[0].role === 'User'
-      ? turns[0].text
-      : turns.map((t) => `${t.role}: ${t.text}`).join('\n\n') + '\n\nAssistant:';
 
   const id = `msg_${crypto.randomBytes(12).toString('hex')}`;
   const model = body.model || 'claude';
@@ -523,10 +570,11 @@ async function anthropicMessages(req, res, body) {
   if (body.stream) res.on('close', () => !res.writableFinished && abort.abort());
 
   const out = await schedule(() =>
-    runClaude({
-      prompt,
+    converse({
+      turns,
       system: contentText(body.system),
       model: cliModel(body.model),
+      voiceKey: req.voice ? String((body.metadata && body.metadata.user_id) || 'default') : null,
       signal: abort.signal,
       onDelta: body.stream ? (text) => { begin(); ev('content_block_delta', { index: 0, delta: { type: 'text_delta', text } }); } : undefined,
     })
@@ -560,7 +608,9 @@ async function anthropicMessages(req, res, body) {
 const server = http.createServer(async (req, res) => {
   try {
     // Clients often glue base URL and path together badly (".../v1//v1/messages"), so normalize first.
-    const path = req.url.split('?')[0].replace(/\/+/g, '/').replace(/^(\/v1)+/, '/v1');
+    const cleanPath = req.url.split('?')[0].replace(/\/+/g, '/');
+    req.voice = /^\/voice(\/|$)/.test(cleanPath);
+    const path = cleanPath.replace(/^\/voice/, '').replace(/^(\/v1)+/, '/v1');
 
     if (req.method === 'GET' && path === '/health') return send(res, 200, { ok: true });
     attachRequestLog(req, res);

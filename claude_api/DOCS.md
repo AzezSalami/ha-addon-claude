@@ -57,6 +57,26 @@ writes it, not all at once at the end. The first words arrive after the Claude C
 - A request containing a YouTube or Instagram link starts streaming after the transcript or caption has been fetched.
 - `/v1/ask` does not stream.
 
+## Voice assistants
+
+For a Home Assistant voice pipeline, put `/voice` in front of the API path. Other apps keep using the normal URLs, so
+Tandoor and similar clients are not affected.
+
+- OpenAI-style clients: base URL `http://<ha-host>:8099/voice/v1`
+- Anthropic-style clients: base URL `http://<ha-host>:8099/voice`
+
+Requests under `/voice` differ in two ways. This applies to `/v1/chat/completions` and `/v1/messages`, not `/v1/ask`.
+
+- **Spoken replies:** Claude is told to answer in one or two short sentences of plain speech, with no markdown, lists or
+  emoji. This replaces Claude Code's own system prompt. Set `voice_instructions` to use your own wording instead. Any
+  system prompt sent by the client is added after it.
+- **Conversation memory:** the add-on continues the same conversation while requests keep coming, and only sends Claude
+  the newest message. The conversation ends after `voice_memory_minutes` without a request (default 10; `0` turns memory
+  off, and the add-on then uses only the history the client sends). Memory is kept until the add-on restarts.
+
+All voice requests share one conversation unless the client sends a `user` field (OpenAI) or `metadata.user_id`
+(Anthropic). In a home with several voice devices, this means they usually share the same memory.
+
 ## YouTube links
 
 Claude cannot watch video, so when a prompt contains a YouTube link (`youtube.com/watch`, `youtu.be`, Shorts or live URLs)

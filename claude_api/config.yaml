@@ -1,5 +1,5 @@
 name: Claude API
-version: "0.8.0"
+version: "0.9.0"
 slug: claude_api
 description: Local HTTP API in front of the Claude Code CLI, using your own Claude Pro login.
 url: https://github.com/AzezSalami/ha-addon-claude
@@ -25,6 +25,8 @@ options:
   fetch_instagram_captions: true
   clean_json_replies: true
   log_requests: "off"
+  voice_instructions: ""
+  voice_memory_minutes: 10
 schema:
   api_token: password
   oauth_token: password?
@@ -36,3 +38,5 @@ schema:
   fetch_instagram_captions: bool
   clean_json_replies: bool
   log_requests: list(off|summary|full)
+  voice_instructions: str?
+  voice_memory_minutes: int(0,1440)
