@@ -43,8 +43,19 @@ Clients that use Anthropic's native format (LiteLLM does this for models named `
 without `/v1` (`http://<ha-host>:8099`), because the client appends `/v1/messages` itself. A doubled path such as
 `/v1//v1/messages` is tolerated.
 
-Supported: `POST /v1/chat/completions` (including `stream: true`, which returns the full reply as one chunk) and `GET /v1/models`.
+Supported: `POST /v1/chat/completions` (including `stream: true`, see below) and `GET /v1/models`.
 Tool calling and image input are not supported.
+
+### Streaming
+
+`stream: true` works on `/v1/chat/completions` and `/v1/messages`: the reply is sent as server-sent events while Claude
+writes it, not all at once at the end. The first words arrive after the Claude CLI has started, usually a few seconds.
+
+- Closing the connection stops the Claude process.
+- A request that asks for JSON (for example Tandoor's recipe import) is not streamed live, because the reply has to be
+  cleaned up as a whole first. With `stream: true` such a client still gets a valid event stream, but it arrives in one go.
+- A request containing a YouTube or Instagram link starts streaming after the transcript or caption has been fetched.
+- `/v1/ask` does not stream.
 
 ## YouTube links
 

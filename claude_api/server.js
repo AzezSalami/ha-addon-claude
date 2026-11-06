@@ -276,9 +276,11 @@ async function runClaude(opts) {
     prompt += `\n\n${JSON_RULE}${RECIPE_REQUEST_RE.test(opts.prompt) ? ` ${RECIPE_RULE}` : ''}`;
   }
   if (LOG_MODE === 'full') logBlock('  prompt sent to claude' + (opts.system ? ` (system: ${opts.system.length} chars)` : ''), prompt);
-  const out = await spawnClaude({ ...opts, prompt });
+  // JSON replies are tidied as a whole, so they cannot be streamed live: the caller then gets the finished reply.
+  const onDelta = asksForJson ? undefined : opts.onDelta;
+  const out = await spawnClaude({ ...opts, prompt, onDelta });
   if (LOG_MODE === 'full') logBlock('  raw reply from claude', out.result);
-  if (CLEAN_JSON && typeof out.result === 'string') {
+  if (!out.streamed && CLEAN_JSON && typeof out.result === 'string') {
     const tidy = tidyJson(out.result, asksForJson);
     if (tidy !== out.result) {
       log('JSON reply tidied (removed code fence or unwrapped single-item array)');
@@ -288,24 +290,62 @@ async function runClaude(opts) {
   return out;
 }
 
-function spawnClaude({ prompt, system, model, sessionId }) {
+// With onDelta, the CLI runs in stream-json mode and onDelta(text) is called for every piece of text as it is generated.
+// The promise still resolves with the complete reply. `signal` kills the process, e.g. when the client disconnects.
+function spawnClaude({ prompt, system, model, sessionId, onDelta, signal }) {
   return new Promise((resolve, reject) => {
     // Built-in tools are disabled: this endpoint is a plain text API, not an agent with shell access.
-    const args = ['-p', '--output-format', 'json', '--tools', ''];
+    const args = ['-p', '--output-format', onDelta ? 'stream-json' : 'json', '--tools', ''];
+    if (onDelta) args.push('--verbose', '--include-partial-messages');
     const useModel = model || DEFAULT_MODEL;
     if (useModel) args.push('--model', useModel);
     if (system) args.push('--append-system-prompt', system);
     if (sessionId) args.push('--resume', sessionId);
 
-    const child = spawn('claude', args, { stdio: ['pipe', 'pipe', 'pipe'], cwd: '/tmp' });
+    const child = spawn('claude', args, { stdio: ['pipe', 'pipe', 'pipe'], cwd: '/tmp', signal });
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
     let out = '';
     let err = '';
+    let pending = '';
+    let final = null;
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
       reject(Object.assign(new Error('claude timed out'), { status: 504 }));
     }, TIMEOUT_MS);
 
-    child.stdout.on('data', (d) => (out += d));
+    const readLine = (line) => {
+      if (!line.trim()) return;
+      let ev;
+      try {
+        ev = JSON.parse(line);
+      } catch {
+        return;
+      }
+      const delta = ev.event && ev.event.delta;
+      if (ev.type === 'stream_event' && ev.event.type === 'content_block_delta' && delta && delta.type === 'text_delta') {
+        try {
+          onDelta(delta.text);
+        } catch {
+          // the client went away; the abort signal ends the process
+        }
+      } else if (ev.type === 'result') {
+        final = ev;
+      }
+    };
+
+    child.stdout.on('data', (d) => {
+      if (!onDelta) {
+        out += d;
+        return;
+      }
+      pending += d;
+      let nl;
+      while ((nl = pending.indexOf('\n')) >= 0) {
+        readLine(pending.slice(0, nl));
+        pending = pending.slice(nl + 1);
+      }
+    });
     child.stderr.on('data', (d) => (err += d));
     child.on('error', (e) => {
       clearTimeout(timer);
@@ -314,15 +354,23 @@ function spawnClaude({ prompt, system, model, sessionId }) {
     child.on('close', (code) => {
       clearTimeout(timer);
       let parsed;
-      try {
-        parsed = JSON.parse(out);
-      } catch {
+      if (onDelta) {
+        readLine(pending);
+        parsed = final;
+      } else {
+        try {
+          parsed = JSON.parse(out);
+        } catch {
+          parsed = null;
+        }
+      }
+      if (!parsed) {
         return reject(Object.assign(new Error(`claude exited ${code}: ${(err || out).slice(0, 500)}`), { status: 502 }));
       }
       if (parsed.is_error) {
         return reject(Object.assign(new Error(String(parsed.result || 'claude error').slice(0, 500)), { status: 502 }));
       }
-      resolve({ result: parsed.result, session_id: parsed.session_id, usage: parsed.usage, cost_usd: parsed.total_cost_usd });
+      resolve({ result: parsed.result, session_id: parsed.session_id, usage: parsed.usage, cost_usd: parsed.total_cost_usd, streamed: Boolean(onDelta) });
     });
 
     child.stdin.end(prompt);
@@ -357,6 +405,12 @@ function cliModel(name) {
   return typeof name === 'string' && /^(claude|sonnet|opus|haiku|fable)/i.test(name) ? name : '';
 }
 
+function startEventStream(req, res) {
+  req.socket.setNoDelay(true);
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' });
+  res.flushHeaders();
+}
+
 function openaiError(res, status, message) {
   send(res, status, { error: { message, type: 'invalid_request_error' } });
 }
@@ -381,13 +435,33 @@ async function chatCompletions(req, res, body) {
       ? turns[0].text
       : turns.map((t) => `${t.role}: ${t.text}`).join('\n\n') + '\n\nAssistant:';
 
-  const out = await schedule(() =>
-    runClaude({ prompt, system: systems.join('\n\n'), model: cliModel(body.model) })
-  );
-
   const id = `chatcmpl-${crypto.randomBytes(8).toString('hex')}`;
   const created = Math.floor(Date.now() / 1000);
   const model = body.model || 'claude';
+  const chunk = (delta, finish) =>
+    `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+
+  // Streaming: the response starts when the first text arrives (or when a buffered JSON reply is ready).
+  const abort = new AbortController();
+  let begun = false;
+  const begin = () => {
+    if (begun) return;
+    begun = true;
+    startEventStream(req, res);
+    res.write(chunk({ role: 'assistant', content: '' }, null));
+  };
+  if (body.stream) res.on('close', () => !res.writableFinished && abort.abort());
+
+  const out = await schedule(() =>
+    runClaude({
+      prompt,
+      system: systems.join('\n\n'),
+      model: cliModel(body.model),
+      signal: abort.signal,
+      onDelta: body.stream ? (text) => { begin(); res.write(chunk({ content: text }, null)); } : undefined,
+    })
+  );
+
   const usage = {
     prompt_tokens: (out.usage && out.usage.input_tokens) || 0,
     completion_tokens: (out.usage && out.usage.output_tokens) || 0,
@@ -395,11 +469,12 @@ async function chatCompletions(req, res, body) {
   };
 
   if (body.stream) {
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
-    const chunk = (delta, finish) =>
-      `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
-    res.write(chunk({ role: 'assistant', content: out.result }, null));
+    begin();
+    if (!out.streamed) res.write(chunk({ content: out.result }, null));
     res.write(chunk({}, 'stop'));
+    if (body.stream_options && body.stream_options.include_usage) {
+      res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [], usage })}\n\n`);
+    }
     res.end('data: [DONE]\n\n');
     return;
   }
@@ -429,25 +504,42 @@ async function anthropicMessages(req, res, body) {
       ? turns[0].text
       : turns.map((t) => `${t.role}: ${t.text}`).join('\n\n') + '\n\nAssistant:';
 
-  const out = await schedule(() =>
-    runClaude({ prompt, system: contentText(body.system), model: cliModel(body.model) })
-  );
-
   const id = `msg_${crypto.randomBytes(12).toString('hex')}`;
   const model = body.model || 'claude';
+  const ev = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
+
+  // Streaming: the response starts when the first text arrives (or when a buffered JSON reply is ready).
+  const abort = new AbortController();
+  let begun = false;
+  const begin = () => {
+    if (begun) return;
+    begun = true;
+    startEventStream(req, res);
+    ev('message_start', {
+      message: { id, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } },
+    });
+    ev('content_block_start', { index: 0, content_block: { type: 'text', text: '' } });
+  };
+  if (body.stream) res.on('close', () => !res.writableFinished && abort.abort());
+
+  const out = await schedule(() =>
+    runClaude({
+      prompt,
+      system: contentText(body.system),
+      model: cliModel(body.model),
+      signal: abort.signal,
+      onDelta: body.stream ? (text) => { begin(); ev('content_block_delta', { index: 0, delta: { type: 'text_delta', text } }); } : undefined,
+    })
+  );
+
   const inputTokens = (out.usage && out.usage.input_tokens) || 0;
   const outputTokens = (out.usage && out.usage.output_tokens) || 0;
 
   if (body.stream) {
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
-    const ev = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
-    ev('message_start', {
-      message: { id, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: inputTokens, output_tokens: 0 } },
-    });
-    ev('content_block_start', { index: 0, content_block: { type: 'text', text: '' } });
-    ev('content_block_delta', { index: 0, delta: { type: 'text_delta', text: out.result } });
+    begin();
+    if (!out.streamed) ev('content_block_delta', { index: 0, delta: { type: 'text_delta', text: out.result } });
     ev('content_block_stop', { index: 0 });
-    ev('message_delta', { delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: outputTokens } });
+    ev('message_delta', { delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { input_tokens: inputTokens, output_tokens: outputTokens } });
     ev('message_stop', {});
     res.end();
     return;
@@ -490,7 +582,10 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         log(`error: ${e.message}`);
         if (!res.headersSent) anthropicError(res, e.status || 500, e.message);
-        else res.end();
+        else if (!res.destroyed && !res.writableEnded) {
+          res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: e.message } })}\n\n`);
+          res.end();
+        }
       }
       return;
     }
@@ -513,7 +608,10 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         log(`error: ${e.message}`);
         if (!res.headersSent) openaiError(res, e.status || 500, e.message);
-        else res.end();
+        else if (!res.destroyed && !res.writableEnded) {
+          res.write(`data: ${JSON.stringify({ error: { message: e.message, type: 'api_error' } })}\n\n`);
+          res.end('data: [DONE]\n\n');
+        }
       }
       return;
     }
